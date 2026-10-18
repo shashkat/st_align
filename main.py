@@ -51,6 +51,7 @@ MAX_TILE = 2048          # max tile side (pixels) read for the detail layer
 MAX_OVERVIEW = 2048      # max side of the always-visible low-res overview
 MAX_CELLS = 25000        # max nucleus outlines drawn at once
 XENIUM_PX_UM = 0.2125    # Xenium morphology level-0 pixel size (µm)
+GAMMA_MAX = 5.0          # gamma slider spans 1/GAMMA_MAX .. GAMMA_MAX
 
 
 # ----------------------------------------------------------------------------- geometry helpers
@@ -239,10 +240,43 @@ class Pane(QtWidgets.QWidget):
         self.last_move = None                    # last mouse position (graphics-scene coords)
         self.last_click = None
 
-        self.hist = None
-        if not img.rgb:
-            self.hist = pg.HistogramLUTWidget()
-            self.hist.setMaximumWidth(110)
+        # display: contrast (min-max) + gamma, applied through a lookup table to overview and tile
+        self.levels = (0.0, 1.0)
+        self.gamma = 1.0
+        self._lut, self._lut_key = None, None
+        self._ov_raw = self._tile_raw = None
+        self._hist_src = None
+
+        self.hplot = pg.PlotWidget()
+        self.hplot.setFixedHeight(40)
+        self.hplot.hideAxis("left")
+        self.hplot.hideAxis("bottom")
+        self.hplot.hideButtons()
+        self.hplot.setMenuEnabled(False)
+        self.hplot.setMouseEnabled(x=False, y=False)
+        self.hplot.setToolTip("Drag the edges to set min / max contrast · double-click for the full range")
+        self.hcurves = []
+        self.region = pg.LinearRegionItem(orientation="vertical", brush=(255, 255, 255, 45))
+        self.region.setZValue(10)
+        self.region.sigRegionChanged.connect(self._region_changed)
+        self.hplot.addItem(self.region)
+        self.hplot.scene().sigMouseClicked.connect(
+            lambda ev: ev.double() and self.set_levels(*self._hrange))
+        self.lv_label = QtWidgets.QLabel("")
+        self.lv_label.setStyleSheet("color: gray")
+        self.lv_label.setMinimumWidth(90)
+        self.gamma_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.gamma_slider.setRange(-100, 100)                   # gamma = GAMMA_MAX ** (v / 100)
+        self.gamma_slider.setFixedWidth(110)
+        self.gamma_slider.setToolTip("Gamma (<1 brightens dim signal, >1 darkens) · double-click to reset")
+        self.gamma_slider.valueChanged.connect(self._gamma_changed)
+        self.gamma_slider.mouseDoubleClickEvent = lambda ev: self.gamma_slider.setValue(0)
+        self.gamma_label = QtWidgets.QLabel("γ 1.00")
+        self.gamma_label.setMinimumWidth(45)
+        auto = QtWidgets.QToolButton()
+        auto.setText("Auto")
+        auto.setToolTip("Auto contrast for the pixels on screen (1st–99.7th percentile) and gamma 1")
+        auto.clicked.connect(self.auto_contrast)
 
         head = QtWidgets.QHBoxLayout()
         lbl = QtWidgets.QLabel(f"<b>{title}</b>  <span style='color:gray'>{os.path.basename(img.path)}</span>")
@@ -255,14 +289,18 @@ class Pane(QtWidgets.QWidget):
         self.info = QtWidgets.QLabel("")
         self.info.setStyleSheet("color: gray")
 
-        body = QtWidgets.QHBoxLayout()
-        body.addWidget(self.glw, 1)
-        if self.hist:
-            body.addWidget(self.hist)
+        disp = QtWidgets.QHBoxLayout()
+        disp.addWidget(QtWidgets.QLabel("Contrast"))
+        disp.addWidget(self.hplot, 1)
+        disp.addWidget(self.lv_label)
+        disp.addWidget(self.gamma_slider)
+        disp.addWidget(self.gamma_label)
+        disp.addWidget(auto)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
         lay.addLayout(head)
-        lay.addLayout(body, 1)
+        lay.addLayout(disp)
+        lay.addWidget(self.glw, 1)
         lay.addWidget(self.info)
 
         self.timer = QtCore.QTimer(self, singleShot=True, interval=80)
@@ -290,29 +328,116 @@ class Pane(QtWidgets.QWidget):
     # -- image layers
     def load_overview(self, auto_contrast=False):
         data, (dx, dy) = self.img.overview()
-        self.ov_item.setImage(data, autoLevels=False)
+        self._ov_raw = data
         self.ov_item.setTransform(qtransform(self.O @ S(dx, dy)))
         self._ov_ds = max(dx, dy)
-        if self.img.rgb:
-            lv = (0, 255) if data.dtype == np.uint8 else tuple(np.percentile(data, [0.5, 99.8]))
-            self.ov_item.setLevels(lv)
-            self._rgb_levels = lv
-        else:
-            self.hist.setImageItem(self.ov_item)
-            if auto_contrast:
-                nz = data[data > 0]
-                lo, hi = np.percentile(nz if nz.size else data, [1, 99.7])
-                self.hist.item.setLevels(float(lo), float(max(hi, lo + 1)))
-            if not getattr(self, "_hist_connected", False):
-                self.hist.item.sigLevelsChanged.connect(self._sync_contrast)
-                self.hist.item.sigLookupTableChanged.connect(self._sync_contrast)
-                self._hist_connected = True
+        self._set_histogram(data)
+        if auto_contrast:
+            if self.img.rgb and data.dtype == np.uint8:
+                lo, hi = 0.0, 255.0
+            else:
+                lo, hi = self._percentile_levels(data)
+            self.levels = (lo, hi)
+        self._show_levels()
+        self.ov_item.setImage(self._render(data), levels=(0, 255), autoLevels=False)
         self._tile_key = None
 
-    def _sync_contrast(self, *a):
-        if self.hist:
-            self.tile_item.setLevels(self.hist.item.getLevels())
-            self.tile_item.setLookupTable(self.hist.item.getLookupTable)
+    # -- contrast / gamma
+    def _displayed_raw(self):
+        return self._tile_raw if self.tile_item.isVisible() and self._tile_raw is not None else self._ov_raw
+
+    def _set_histogram(self, data):
+        """Histogram strip of the pixels on screen (pyramid levels differ: the overview is blurred)."""
+        if data is self._hist_src:
+            return
+        self._hist_src = data
+        if data.dtype == np.uint8:
+            lo0, hi0 = 0.0, 255.0
+        else:
+            lo0, hi0 = float(data.min()), float(data.max())
+        hi0 = max(hi0, lo0 + 1)
+        self._hrange = (lo0, hi0)
+        step = max(1, int(math.sqrt(data.shape[0] * data.shape[1] / 1e6)))   # ~1 Mpx sample
+        sample = data[::step, ::step]
+        chans = [sample[..., i] for i in range(3)] if sample.ndim == 3 else [sample]
+        colors = [(255, 80, 80), (80, 255, 80), (90, 140, 255)] if len(chans) == 3 else [(200, 200, 200)]
+        for c in self.hcurves:
+            self.hplot.removeItem(c)
+        self.hcurves = []
+        for ch, col in zip(chans, colors):
+            cnt, edges = np.histogram(ch, bins=256, range=(lo0, hi0))
+            y = np.log1p(cnt.astype(float))
+            y /= max(y.max(), 1e-9)
+            c = pg.PlotCurveItem(edges, y, stepMode="center", fillLevel=0, pen=pg.mkPen(col),
+                                 brush=pg.mkBrush(*col, 60))
+            self.hplot.addItem(c)
+            self.hcurves.append(c)
+        self._fit_hrange()
+
+    def _fit_hrange(self):
+        """Strip spans the on-screen data range, widened to keep the current levels reachable."""
+        lo = min(self._hrange[0], self.levels[0])
+        hi = max(self._hrange[1], self.levels[1])
+        self.hplot.setXRange(lo, hi, padding=0)
+        self.hplot.setYRange(0, 1.05, padding=0)
+        self.region.blockSignals(True)          # clamping the handles must not overwrite self.levels
+        self.region.setBounds((lo, hi))
+        self.region.blockSignals(False)
+
+    @staticmethod
+    def _percentile_levels(data):
+        nz = data[data > 0]
+        lo, hi = np.percentile(nz if nz.size else data, [1, 99.7])
+        return float(lo), float(max(hi, lo + 1))
+
+    def _show_levels(self):
+        lo, hi = self.levels
+        self._fit_hrange()
+        self.region.blockSignals(True)
+        self.region.setRegion((lo, hi))
+        self.region.blockSignals(False)
+        self.lv_label.setText(f"{lo:.0f} – {hi:.0f}")
+
+    def _region_changed(self):
+        lo, hi = self.region.getRegion()
+        self.levels = (float(lo), float(max(hi, lo + 1e-6)))
+        self.lv_label.setText(f"{lo:.0f} – {hi:.0f}")
+        self._redisplay()
+
+    def _gamma_changed(self, v):
+        self.gamma = GAMMA_MAX ** (v / 100)
+        self.gamma_label.setText(f"γ {self.gamma:.2f}")
+        self._redisplay()
+
+    def set_levels(self, lo, hi):
+        self.levels = (float(lo), float(hi))
+        self._show_levels()
+        self._redisplay()
+
+    def auto_contrast(self):
+        self.levels = self._percentile_levels(self._displayed_raw())
+        self._show_levels()
+        self.gamma_slider.setValue(0)                           # re-renders if gamma changed
+        self._redisplay()
+
+    def _render(self, data):
+        """Raw pixels -> uint8 display values: clip to levels, normalise, apply gamma."""
+        lo, hi = self.levels
+        if data.dtype in (np.uint8, np.uint16):                 # lookup table, fast for RGB too
+            key = (data.dtype, lo, hi, self.gamma)
+            if key != self._lut_key:
+                x = np.arange(np.iinfo(data.dtype).max + 1, dtype=np.float32)
+                self._lut = (np.clip((x - lo) / (hi - lo), 0, 1) ** self.gamma * 255).astype(np.uint8)
+                self._lut_key = key
+            return self._lut[data]
+        x = np.clip((data.astype(np.float32) - lo) / (hi - lo), 0, 1)
+        return (x ** self.gamma * 255).astype(np.uint8)
+
+    def _redisplay(self):
+        if self._ov_raw is not None:
+            self.ov_item.setImage(self._render(self._ov_raw), levels=(0, 255), autoLevels=False)
+        if self._tile_raw is not None and self.tile_item.isVisible():
+            self.tile_item.setImage(self._render(self._tile_raw), levels=(0, 255), autoLevels=False)
 
     def set_channel(self, i):
         self.img.channel = i
@@ -360,18 +485,17 @@ class Pane(QtWidgets.QWidget):
                 k[2] * dx >= min(w * dx, need[2]) and k[4] * dy >= min(h * dy, need[3]):
             return                                              # current tile still covers the view
         data = img.read(lvl, r0, r1, c0, c1)
-        self.tile_item.setImage(data, autoLevels=False)
-        if img.rgb:
-            self.tile_item.setLevels(self._rgb_levels)
-        else:
-            self._sync_contrast()
+        self._tile_raw = data
+        self.tile_item.setImage(self._render(data), levels=(0, 255), autoLevels=False)
         self.tile_item.setTransform(qtransform(self.O @ T(c0 * dx, r0 * dy) @ S(dx, dy)))
         self.tile_item.show()
+        self._set_histogram(data)
         self._tile_key = (lvl, c0, c1, r0, r1, img.channel)
         self.info.setText(f"level {lvl} (1/{max(dx, dy):.0f})")
 
     def _settle(self):
         self.refresh_tile()
+        self._set_histogram(self._displayed_raw())
         self.settled.emit()
 
     # -- overlays
