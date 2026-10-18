@@ -669,16 +669,25 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f"Keypoint #{i + 1} selected — arrow keys nudge its IF position "
                                          f"(Shift = 10 px).")
 
-    def _redraw_keypoints(self):
+    def _redraw_markers(self):
         L_pts = np.array([p[0] for p in self.pairs]).reshape(-1, 2)
         R_pts = np.array([p[1] for p in self.pairs]).reshape(-1, 2)
         self.L.set_keypoints(L_pts, self.pending["L"], self.sel)
         self.R.set_keypoints(R_pts, self.pending["R"], self.sel)
+
+    def _redraw_keypoints(self):
+        self._redraw_markers()
+        # update rows in place: rebuilding the list mid-click would swallow double-clicks
         self.list.blockSignals(True)
-        self.list.clear()
+        while self.list.count() > len(self.pairs):
+            self.list.takeItem(self.list.count() - 1)
         for i, (a, b) in enumerate(self.pairs):
             res = f"   {self._res_um[i]:.2f} µm" if self.A is not None and len(self.pairs) > 3 else ""
-            self.list.addItem(f"#{i + 1}  X({a[0]:.0f},{a[1]:.0f})  IF({b[0]:.0f},{b[1]:.0f}){res}")
+            text = f"#{i + 1}  X({a[0]:.0f},{a[1]:.0f})  IF({b[0]:.0f},{b[1]:.0f}){res}"
+            if i < self.list.count():
+                self.list.item(i).setText(text)
+            else:
+                self.list.addItem(text)
         self.list.setCurrentRow(-1 if self.sel is None else self.sel)
         self.list.blockSignals(False)
         # re-map the drawn outlines right away; re-select which nuclei to draw a moment later
@@ -688,7 +697,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _list_row_changed(self, row):
         self.sel = row if row >= 0 else None
-        self._redraw_keypoints()
+        self._redraw_markers()              # leave the list alone so its double-click still fires
 
     def _nudge(self, dx, dy):
         """Arrow keys: move the locked ghost, else the selected keypoint's IF position (screen px)."""
@@ -726,10 +735,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _jump_to_pair(self, item):
         a, b = self.pairs[self.list.row(item)]
-        self._active = "L"
+        self._active = "L"                  # with linked views, only the left pane drives the sync
         self.L.center_on(a)
-        if not self.a_link.isChecked():
-            self.R.center_on(b)
+        self.R.center_on(b)                 # centre on the pair itself, not on the fit's estimate
 
     # ---------------------------------------------------------------- overlay placement (ghost)
     def _overlay_toggled(self, on):
