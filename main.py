@@ -21,6 +21,8 @@ Workflow (overlay placement, needs --boundaries)
      To refine an existing keypoint, pick it in the list (or turn overlay mode off and click it) and
      use the arrow keys to nudge its IF position: the red overlay updates immediately.
   5. Save (Ctrl+S) writes keypoints + both affine directions to a folder of your choice.
+     keypoints.csv uses Xenium Explorer's format (fixedX,fixedY,alignmentX,alignmentY: Xenium px,
+     raw IF px), so it can be imported there, and Xenium Explorer exports can be loaded here.
 
 Classic placement: press K and click matching points, one click in each pane = one pair.
 
@@ -33,6 +35,7 @@ Run:
                    --boundaries nucleus_boundaries.parquet
 """
 import argparse
+import csv
 import json
 import math
 import os
@@ -53,6 +56,10 @@ MAX_CELLS = 25000        # max nucleus outlines drawn at once (backstop; MIN_NUC
 MIN_NUC_PX = 6           # draw outlines only once a typical nucleus is this many screen px across
 OUTLINE_PAD = 0.25       # select outlines for the view padded by this fraction, reuse until it leaves
 XENIUM_PX_UM = 0.2125    # Xenium morphology level-0 pixel size (µm)
+# keypoints.csv columns, as exported/imported by Xenium Explorer's image alignment:
+# fixed = Xenium morphology level-0 px, alignment = raw level-0 px of the aligned (IF / H&E) image
+KP_COLS = ("fixedX", "fixedY", "alignmentX", "alignmentY")
+KP_COLS_OLD = ("xenium_x_px", "xenium_y_px", "if_x_px", "if_y_px")   # earlier xalign files
 GAMMA_MAX = 5.0          # gamma slider spans 1/GAMMA_MAX .. GAMMA_MAX
 
 
@@ -1066,11 +1073,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def save_to(self, d):
         X = np.array([p[0] for p in self.pairs])
         U = np.array([p[1] for p in self.pairs])
-        hdr = "xenium_x_px,xenium_y_px,if_x_px,if_y_px,xenium_x_um,xenium_y_um,residual_um"
         res = self._res_um if len(self.pairs) > 3 else np.zeros(len(X))
-        np.savetxt(os.path.join(d, "keypoints.csv"),
-                   np.column_stack([X, U, X * self.px_um, res]), delimiter=",", header=hdr,
-                   comments="", fmt="%.4f")
+        with open(os.path.join(d, "keypoints.csv"), "w", newline="") as f:
+            wr = csv.writer(f, lineterminator="\n")
+            wr.writerow(KP_COLS)
+            wr.writerows([repr(float(v)) for v in row] for row in np.column_stack([X, U]))
         np.savetxt(os.path.join(d, "xenium_px_to_if_px.csv"), self.A, delimiter=",", fmt="%.10g")
         np.savetxt(os.path.join(d, "if_px_to_xenium_px.csv"), np.linalg.inv(self.A), delimiter=",", fmt="%.10g")
         meta = {
@@ -1083,6 +1090,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "if_px_to_xenium_px": np.linalg.inv(self.A).tolist(),
             "display_orientation_if": self.R.O.tolist(),
             "n_pairs": len(self.pairs),
+            "keypoint_residuals_um": res.tolist(),
         }
         with open(os.path.join(d, "alignment.json"), "w") as f:
             json.dump(meta, f, indent=2)
@@ -1093,8 +1101,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self.load_keypoints(p)
 
     def load_keypoints(self, p):
-        a = np.loadtxt(p, delimiter=",", skiprows=1, ndmin=2)
-        self.pairs = [(r[0:2].copy(), r[2:4].copy()) for r in a]
+        """keypoints.csv in Xenium Explorer format (fixedX,fixedY,alignmentX,alignmentY);
+        files saved by earlier versions of this tool are accepted too."""
+        with open(p, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            header = [h.strip() for h in reader.fieldnames or []]
+            reader.fieldnames = header
+            cols = next((c for c in (KP_COLS, KP_COLS_OLD) if set(c) <= set(header)), None)
+            if cols is None:
+                QtWidgets.QMessageBox.warning(self, "Load keypoints",
+                                              f"Expected columns {', '.join(KP_COLS)} — got {', '.join(header)}")
+                return
+            rows = [[float(r[c]) for c in cols] for r in reader if any((v or "").strip() for v in r.values())]
+        self.pairs = [(np.array(r[:2]), np.array(r[2:])) for r in rows]
         self.pending, self.sel = {"L": None, "R": None}, None
         self._pairs_changed()
 
@@ -1105,7 +1124,7 @@ def main():
     ap.add_argument("--if", dest="if_path", required=True, help="post-Xenium IF image (TIFF/OME-TIFF)")
     ap.add_argument("--boundaries", help="nucleus_boundaries.parquet (optional, for the overlay)")
     ap.add_argument("--pixel-size", type=float, help=f"Xenium µm/px (default: from OME, else {XENIUM_PX_UM})")
-    ap.add_argument("--keypoints", help="keypoints.csv from a previous session")
+    ap.add_argument("--keypoints", help="keypoints.csv (Xenium Explorer format: fixedX,fixedY,alignmentX,alignmentY)")
     args = ap.parse_args()
 
     app = pg.mkQApp("xalign")
