@@ -26,7 +26,7 @@ Workflow (overlay placement, needs --boundaries)
 
 Classic placement: press K and click matching points, one click in each pane = one pair.
 
-Keys:  O overlay place · K pair-click mode · L link · N nuclei · arrows nudge (Shift x10)
+Keys:  O overlay place · K pair-click mode · L link · N nuclei · M mirror cursor · arrows nudge (Shift x10)
        [ ] rotate ghost · - = scale ghost · Esc unlock · Ctrl+Z undo · Del delete selected · Ctrl+S save
        Select a keypoint in the list (or click it with overlay mode off); double-click to jump to it.
 
@@ -669,6 +669,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.a_link.setEnabled(False)
         self.a_nuc = act("Show nuclei", self._update_outlines, "N", True)
         self.a_nuc.setEnabled(self.bounds is not None)
+        self.a_cur = act("Mirror cursor", self._mirror_toggled, "M", True,
+                         "Show a yellow cross in the other pane where the cursor maps")
+        self.a_cur.setChecked(True)
         tb.addSeparator()
         act("Load keypoints…", self._load)
         act("Save…", self._save, "Ctrl+S")
@@ -997,6 +1000,11 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             self._syncing = False
 
+    def _mirror_toggled(self, on):
+        if not on:
+            self.L.set_cursor(None)
+            self.R.set_cursor(None)
+
     def _hovered(self, side, x, y):
         self._active = side
         if side == "R" and self.g_state == "float":
@@ -1006,7 +1014,7 @@ class MainWindow(QtWidgets.QMainWindow):
         A = self._current_map()
         xen = np.array([x, y]) if side == "L" else (apply(np.linalg.inv(A), [[x, y]])[0]
                                                    if A is not None else None)
-        if A is not None:
+        if A is not None and self.a_cur.isChecked():
             other = apply(A, [[x, y]])[0] if side == "L" else xen
             dst.set_cursor(other)
         else:
