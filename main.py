@@ -15,17 +15,18 @@ Workflow (overlay placement, needs --boundaries)
   3. Click when the outlines match the IF nuclei: the overlay locks in place. Arrow keys nudge the
      locked overlay (Shift = 10x), Esc unlocks. Then click the spot you are most confident about:
      that becomes the keypoint. Pan the Xenium pane elsewhere and repeat for keypoints 2 and 3.
-  4. After 3 keypoints an affine is fitted, the views are linked and the nuclei overlay is drawn
-     through the fit. Click a keypoint (or pick it in the list) and use the arrow keys to nudge its
-     IF position: the overlay updates immediately. While still in overlay mode, clicking anywhere
-     else adds a new keypoint there (initially on the fit), which you can then nudge.
+  4. After 3 keypoints an affine is fitted, the views are linked and the nuclei overlay (red) is
+     drawn through the fit. Overlay mode keeps working the same way: float, lock and click to add
+     keypoint 4, 5, ... (with linked views, use - / = rather than the wheel to adjust the scale).
+     To refine an existing keypoint, pick it in the list (or turn overlay mode off and click it) and
+     use the arrow keys to nudge its IF position: the red overlay updates immediately.
   5. Save (Ctrl+S) writes keypoints + both affine directions to a folder of your choice.
 
 Classic placement: press K and click matching points, one click in each pane = one pair.
 
 Keys:  O overlay place · K pair-click mode · L link · N nuclei · arrows nudge (Shift x10)
        [ ] rotate ghost · - = scale ghost · Esc unlock · Ctrl+Z undo · Del delete selected · Ctrl+S save
-       Click a keypoint to select it; double-click a pair in the list to jump to it.
+       Select a keypoint in the list (or click it with overlay mode off); double-click to jump to it.
 
 Run:
   python xalign.py --xenium morphology_focus_0000.ome.tif --if post_if.ome.tif \\
@@ -569,15 +570,14 @@ class MainWindow(QtWidgets.QMainWindow):
         return M if src == "L" else np.linalg.inv(M)
 
     def _current_map(self):
-        """Best available Xenium px -> IF raw px mapping (fit, locked ghost or floating ghost)."""
-        if self.A is not None:
-            return self.A
+        """Xenium px -> IF raw px mapping for the cursor: the ghost while placing, else the fit."""
         if self.g_state == "locked":
             return self.A_lock
         if self.g_state == "float":
             G = self._float_G()
-            return None if G is None else np.linalg.inv(self.R.O) @ G
-        return None
+            if G is not None:
+                return np.linalg.inv(self.R.O) @ G
+        return self.A
 
     def _fit(self):
         was_fitted = self.A is not None
@@ -658,24 +658,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.statusBar().showMessage(
                     f"Keypoint {n} placed. Pan the Xenium pane to a different region and match again "
                     f"({3 - n} more needed)." if self.A is None else
-                    "3 keypoints placed: views linked. Select a keypoint and nudge it with the arrow keys; "
-                    "click elsewhere to add more.")
+                    f"Keypoint {n} placed{' — views linked' if n == 3 else ''}. Move to another region and "
+                    f"match again to add more, or turn overlay mode off (O) to select and nudge keypoints.")
             return
-        # selection, or (overlay mode with a fit) add a keypoint on the current fit
+        # selection
         i = pane.hit(np.array([p[0 if side == "L" else 1] for p in self.pairs]).reshape(-1, 2), pane.last_click)
         if i is not None:
             self.sel = i
             self._redraw_keypoints()
             self.statusBar().showMessage(f"Keypoint #{i + 1} selected — arrow keys nudge its IF position "
                                          f"(Shift = 10 px).")
-        elif self.a_ov.isChecked() and self.A is not None:
-            p = np.array([x, y])
-            if side == "L":
-                self._add_pair(p, apply(self.A, [p])[0])
-            else:
-                self._add_pair(apply(np.linalg.inv(self.A), [p])[0], p)
-            self.statusBar().showMessage(f"Keypoint #{self.sel + 1} added on the current fit — "
-                                         f"nudge it with the arrow keys until the outlines match.")
 
     def _redraw_keypoints(self):
         L_pts = np.array([p[0] for p in self.pairs]).reshape(-1, 2)
@@ -743,13 +735,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _overlay_toggled(self, on):
         if on:
             self.a_kp.setChecked(False)
-            self.g_state = "float" if self.A is None else "off"
+            self.g_state = "float"
             self._reload_ghost()
             self.statusBar().showMessage(
                 "Overlay mode: move the mouse over the IF pane — the Xenium nuclei follow it. Click when they "
-                "match ([ ] rotate, - = scale, wheel zooms the IF)." if self.A is None else
-                "Overlay mode: click to add a keypoint on the current fit, or click a keypoint to select it; "
-                "arrow keys nudge.")
+                "match ([ ] rotate, - = scale" + (", wheel zooms the IF)." if self.A is None else ")."))
         else:
             self.g_state = "off"
             self.statusBar().showMessage("Overlay mode off.")
@@ -758,10 +748,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _sync_ghost_state(self):
         if not self.a_ov.isChecked():
             self.g_state = "off"
-        elif self.A is not None and self.g_state == "float":
-            self.g_state = "off"
-        elif self.A is None and self.g_state == "off":
-            self.g_state = "float"
+        elif self.g_state == "float":
             self._reload_ghost()
         self._update_ghost()
 
