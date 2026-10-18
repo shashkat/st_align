@@ -49,7 +49,9 @@ pg.setConfigOptions(imageAxisOrder="row-major", antialias=False)
 
 MAX_TILE = 2048          # max tile side (pixels) read for the detail layer
 MAX_OVERVIEW = 2048      # max side of the always-visible low-res overview
-MAX_CELLS = 25000        # max nucleus outlines drawn at once
+MAX_CELLS = 25000        # max nucleus outlines drawn at once (backstop; MIN_NUC_PX normally decides)
+MIN_NUC_PX = 6           # draw outlines only once a typical nucleus is this many screen px across
+OUTLINE_PAD = 0.25       # select outlines for the view padded by this fraction, reuse until it leaves
 XENIUM_PX_UM = 0.2125    # Xenium morphology level-0 pixel size (µm)
 GAMMA_MAX = 5.0          # gamma slider spans 1/GAMMA_MAX .. GAMMA_MAX
 
@@ -177,24 +179,30 @@ class Boundaries:
         import pandas as pd
         df = pd.read_parquet(path, columns=["cell_id", "vertex_x", "vertex_y"])
         codes, _ = pd.factorize(df["cell_id"], sort=False)
-        self.codes = codes
-        self.x = df["vertex_x"].to_numpy(float) / px_um
-        self.y = df["vertex_y"].to_numpy(float) / px_um
+        order = np.argsort(codes, kind="stable")             # each cell's vertices contiguous
+        codes = codes[order]
+        self.x = df["vertex_x"].to_numpy(float)[order] / px_um
+        self.y = df["vertex_y"].to_numpy(float)[order] / px_um
         n = codes.max() + 1
-        cnt = np.bincount(codes, minlength=n)
-        self.cx = np.bincount(codes, weights=self.x, minlength=n) / cnt
-        self.cy = np.bincount(codes, weights=self.y, minlength=n) / cnt
+        self.cnt = np.bincount(codes, minlength=n)
+        self.start = np.concatenate([[0], np.cumsum(self.cnt)[:-1]])
+        self.cx = np.bincount(codes, weights=self.x, minlength=n) / self.cnt
+        self.cy = np.bincount(codes, weights=self.y, minlength=n) / self.cnt
+        self.connect = np.ones(len(codes), dtype=bool)       # False on each cell's last vertex
+        self.connect[self.start + self.cnt - 1] = False
+        w = np.maximum.reduceat(self.x, self.start) - np.minimum.reduceat(self.x, self.start)
+        h = np.maximum.reduceat(self.y, self.start) - np.minimum.reduceat(self.y, self.start)
+        self.typical_size = float(np.median(np.maximum(w, h)))  # Xenium px
 
     def select(self, x0, y0, x1, y1):
-        sel = (self.cx >= x0) & (self.cx <= x1) & (self.cy >= y0) & (self.cy <= y1)
-        n = int(sel.sum())
+        """Outlines of the cells whose centroid is in the box; cost scales with the selection."""
+        cells = np.flatnonzero((self.cx >= x0) & (self.cx <= x1) & (self.cy >= y0) & (self.cy <= y1))
+        n = len(cells)
         if n == 0 or n > MAX_CELLS:
             return None, n
-        vm = sel[self.codes]
-        x, y, c = self.x[vm], self.y[vm], self.codes[vm]
-        connect = np.zeros(len(c), dtype=bool)
-        connect[:-1] = c[:-1] == c[1:]
-        return (np.column_stack([x, y]), connect), n
+        c = self.cnt[cells]
+        idx = np.arange(c.sum()) + np.repeat(self.start[cells] - np.cumsum(c) + c, c)
+        return (np.column_stack([self.x[idx], self.y[idx]]), self.connect[idx]), n
 
 
 # ----------------------------------------------------------------------------- one image pane
@@ -670,13 +678,14 @@ class MainWindow(QtWidgets.QMainWindow):
         key("=", lambda: self._ghost_adjust(scale=1.005))
         key("Escape", self._escape)
 
+        self._out_box = {"L": None, "R": None}   # Xenium-px box each pane's outlines were selected for
         self.out_timer = QtCore.QTimer(self, singleShot=True, interval=120)
         self.out_timer.timeout.connect(self._update_outlines)
 
         for side_, pane in (("L", self.L), ("R", self.R)):
             pane.clicked.connect(lambda x, y, s=side_: self._clicked(s, x, y))
             pane.hovered.connect(lambda x, y, s=side_: self._hovered(s, x, y))
-            pane.settled.connect(self._update_outlines)
+            pane.settled.connect(lambda s=side_: self._update_outlines(sides=s))
             pane.vb.sigRangeChanged.connect(lambda *a, s=side_: self._range_changed(s))
             pane.vb.sigRangeChanged.connect(lambda *a: self._update_ghost())
         self.L.settled.connect(self._reload_ghost)
@@ -888,13 +897,16 @@ class MainWindow(QtWidgets.QMainWindow):
         """Ghost = Xenium nuclei currently visible in the left pane (re-read when it settles)."""
         if self.g_state != "float" or self.bounds is None:
             return
-        res, n = self.bounds.select(*self.L.visible_raw_bbox())
+        if self._nuc_screen_px(self.L, self.L.O) < MIN_NUC_PX:
+            res, n = None, -1
+        else:
+            res, n = self.bounds.select(*self.L.visible_raw_bbox())
         self.R.set_ghost(res)
         self._ghost_ok = res is not None
         if res is None:
             self.statusBar().showMessage(
-                f"{n} nuclei in the Xenium view — zoom the Xenium pane in to float them." if n else
-                "No nuclei in the Xenium view — pan the Xenium pane onto tissue.")
+                "No nuclei in the Xenium view — pan the Xenium pane onto tissue." if n == 0 else
+                "Zoom the Xenium pane in to float its nuclei.")
         self._update_ghost()
 
     def _float_G(self):
@@ -1001,26 +1013,43 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(msg)
 
     # ---------------------------------------------------------------- nuclei overlay
-    def _update_outlines(self, *a):
+    def _nuc_screen_px(self, pane, M):
+        """Typical nucleus size in screen px on a pane, given M: Xenium px -> that pane's scene."""
+        scale = math.sqrt(abs(np.linalg.det(M[:2, :2])))
+        return self.bounds.typical_size * scale / float(np.mean(pane.vb.viewPixelSize()))
+
+    def _update_outlines(self, *a, sides="LR"):
         if self.bounds is None or not self.a_nuc.isChecked():
-            self.L.set_outline(None)
-            self.R.set_outline(None)
+            for side, pane in (("L", self.L), ("R", self.R)):
+                pane.set_outline(None)
+                self._out_box[side] = None
             return
-        # left: directly in Xenium px
-        res, n = self.bounds.select(*self.L.visible_raw_bbox())
-        self.L.set_outline(res, self.L.O)
-        msgs = [] if res is not None or n == 0 else [f"left: {n} nuclei in view — zoom in to draw"]
-        # right: through the affine (vertices stay in Xenium px; the item transform does the mapping)
-        if self.A is None:
-            self.R.set_outline(None)
-        else:
-            Ainv = np.linalg.inv(self.A)
-            x0, y0, x1, y1 = self.R.visible_raw_bbox()
-            xb = bbox(apply(Ainv, [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]))
-            res, n = self.bounds.select(*xb)
-            self.R.set_outline(res, self.R.O @ self.A)
+        msgs = []
+        for side in sides:
+            pane = self.L if side == "L" else self.R
+            if side == "R" and self.A is None:
+                pane.set_outline(None)
+                self._out_box[side] = None
+                continue
+            # vertices stay in Xenium px; the item transform M maps them onto the pane
+            M = pane.O if side == "L" else pane.O @ self.A
+            if self._nuc_screen_px(pane, M) < MIN_NUC_PX:
+                pane.set_outline(None)
+                self._out_box[side] = None
+                msgs.append(f"{'left' if side == 'L' else 'right'}: zoom in to see nuclei")
+                continue
+            x0, y0, x1, y1 = bbox(apply(np.linalg.inv(M), rect_corners(pane.vb.viewRect())))
+            box = self._out_box[side]
+            if box and box[0] <= x0 and box[1] <= y0 and box[2] >= x1 and box[3] >= y1:
+                pane.outline.setTransform(qtransform(M))      # still covered: just re-map
+                continue
+            px, py = (x1 - x0) * OUTLINE_PAD, (y1 - y0) * OUTLINE_PAD
+            box = (x0 - px, y0 - py, x1 + px, y1 + py)
+            res, n = self.bounds.select(*box)
+            pane.set_outline(res, M)
+            self._out_box[side] = box if res is not None else None
             if res is None and n:
-                msgs.append(f"right: {n} nuclei in view — zoom in to draw")
+                msgs.append(f"{'left' if side == 'L' else 'right'}: {n} nuclei in view — zoom in to draw")
         if msgs:
             self.statusBar().showMessage(" · ".join(msgs))
 
