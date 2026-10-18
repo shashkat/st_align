@@ -5,22 +5,30 @@ xalign — two-pane prototype for aligning a post-Xenium IF image to the Xenium 
 Left pane  : Xenium morphology image (fixed), e.g. morphology_focus/morphology_focus_0000.ome.tif
 Right pane : post-Xenium IF image (moving), any OME-TIFF / TIFF (pyramidal strongly recommended)
 
-Workflow
+Workflow (overlay placement, needs --boundaries)
   1. Flip / rotate the IF pane until it looks like the DAPI pane (display only; the raw IF
      pixel coordinates are what get exported, so you never have to flip the image in code).
-  2. Press K (or the toolbar button) and click matching points: one click in each pane = one pair.
-     Order doesn't matter. Plain drags still pan; wheel zooms.
-  3. After 3 pairs an affine is fitted automatically. Press L to link the panes: moving either one
-     moves the other to the corresponding region, and a yellow cross shows where your cursor maps.
-  4. Press N to overlay Xenium nucleus outlines (needs --boundaries). On the IF pane they are drawn
-     through the current affine, so this is the "does it fit" check.
+  2. Zoom both panes to roughly the same scale, then press O (Overlay place). The Xenium nuclei
+     visible in the left pane now float over the IF pane, following the mouse (the left pane's
+     centre sits under the cursor). Wheel-zoom the IF pane to fine-tune scale; [ / ] rotate the
+     ghost, - / = scale it.
+  3. Click when the outlines match the IF nuclei: the overlay locks in place. Arrow keys nudge the
+     locked overlay (Shift = 10x), Esc unlocks. Then click the spot you are most confident about:
+     that becomes the keypoint. Pan the Xenium pane elsewhere and repeat for keypoints 2 and 3.
+  4. After 3 keypoints an affine is fitted, the views are linked and the nuclei overlay is drawn
+     through the fit. Click a keypoint (or pick it in the list) and use the arrow keys to nudge its
+     IF position: the overlay updates immediately. While still in overlay mode, clicking anywhere
+     else adds a new keypoint there (initially on the fit), which you can then nudge.
   5. Save (Ctrl+S) writes keypoints + both affine directions to a folder of your choice.
 
-Keys:  K keypoint mode · L link · N nuclei · Ctrl+Z undo · Del delete selected pair · Ctrl+S save
-       Double-click a pair in the list to jump to it.
+Classic placement: press K and click matching points, one click in each pane = one pair.
+
+Keys:  O overlay place · K pair-click mode · L link · N nuclei · arrows nudge (Shift x10)
+       [ ] rotate ghost · - = scale ghost · Esc unlock · Ctrl+Z undo · Del delete selected · Ctrl+S save
+       Click a keypoint to select it; double-click a pair in the list to jump to it.
 
 Run:
-  python xalign.py --xenium morphology_focus_0000.ome.tif --if post_if.ome.tif \
+  python xalign.py --xenium morphology_focus_0000.ome.tif --if post_if.ome.tif \\
                    --boundaries nucleus_boundaries.parquet
 """
 import argparse
@@ -63,6 +71,12 @@ def T(tx, ty):
 
 def S(sx, sy):
     return np.array([[sx, 0, 0], [0, sy, 0], [0, 0, 1]], float)
+
+
+def Rot(theta):
+    """Rotation by theta radians; positive = clockwise on screen (y points down)."""
+    c, s = math.cos(theta), math.sin(theta)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], float)
 
 
 FLIP_H = np.array([[-1, 0, 0], [0, 1, 0], [0, 0, 1]], float)
@@ -204,16 +218,25 @@ class Pane(QtWidgets.QWidget):
         self.tile_item.setZValue(1)
         self.outline = pg.PlotCurveItem(pen=pg.mkPen((255, 70, 70), width=1))
         self.outline.setZValue(5)
+        self.ghost = pg.PlotCurveItem(pen=pg.mkPen((0, 220, 255), width=1))   # floating overlay
+        self.ghost.setZValue(6)
+        self.ghost.hide()
         self.kp = pg.ScatterPlotItem(size=12, symbol="o", pen=pg.mkPen((0, 255, 120), width=2),
                                      brush=None)
         self.kp.setZValue(10)
+        self.sel_kp = pg.ScatterPlotItem(size=20, symbol="o", pen=pg.mkPen((255, 0, 255), width=2),
+                                         brush=None)
+        self.sel_kp.setZValue(10)
         self.pending = pg.ScatterPlotItem(size=14, symbol="x", pen=pg.mkPen((255, 255, 0), width=2))
         self.pending.setZValue(11)
         self.cursor = pg.ScatterPlotItem(size=22, symbol="+", pen=pg.mkPen((255, 230, 0), width=2))
         self.cursor.setZValue(12)
-        for it in (self.ov_item, self.tile_item, self.outline, self.kp, self.pending, self.cursor):
+        for it in (self.ov_item, self.tile_item, self.outline, self.ghost, self.kp, self.sel_kp,
+                   self.pending, self.cursor):
             self.vb.addItem(it)
         self.labels = []
+        self.last_move = None                    # last mouse position (graphics-scene coords)
+        self.last_click = None
 
         self.hist = None
         if not img.rgb:
@@ -351,7 +374,7 @@ class Pane(QtWidgets.QWidget):
         self.settled.emit()
 
     # -- overlays
-    def set_keypoints(self, raw_pts, pending_raw=None):
+    def set_keypoints(self, raw_pts, pending_raw=None, sel=None):
         for t in self.labels:
             self.vb.removeItem(t)
         self.labels = []
@@ -366,13 +389,35 @@ class Pane(QtWidgets.QWidget):
                 self.labels.append(t)
         else:
             self.kp.setData(pos=np.empty((0, 2)))
+        self.sel_kp.setData(pos=self.to_scene(raw_pts[sel]) if sel is not None else np.empty((0, 2)))
         self.pending.setData(pos=self.to_scene(pending_raw) if pending_raw is not None else np.empty((0, 2)))
 
-    def set_outline(self, scene_pts, connect):
-        if scene_pts is None:
-            self.outline.setData(x=np.array([]), y=np.array([]))
+    @staticmethod
+    def _set_curve(item, res, M):
+        """res = (Xenium px vertices, connect) from Boundaries.select; M maps Xenium px -> scene.
+        Vertices stay in Xenium px and only the item transform changes, so re-mapping is instant."""
+        if res is None:
+            item.setData(x=np.array([]), y=np.array([]))
         else:
-            self.outline.setData(x=scene_pts[:, 0], y=scene_pts[:, 1], connect=connect)
+            item.setData(x=res[0][:, 0], y=res[0][:, 1], connect=res[1])
+            item.setTransform(qtransform(M))
+
+    def set_outline(self, res, M=None):
+        self._set_curve(self.outline, res, M)
+
+    def set_ghost(self, res):
+        self._set_curve(self.ghost, res, np.eye(3))
+
+    def hit(self, raw_pts, scene_pos, tol=10):
+        """Index of the keypoint within tol screen px of scene_pos (graphics-scene coords), or None."""
+        if not len(raw_pts):
+            return None
+        d = []
+        for p in self.to_scene(raw_pts):
+            q = self.vb.mapViewToScene(QtCore.QPointF(*p)) - scene_pos
+            d.append(math.hypot(q.x(), q.y()))
+        i = int(np.argmin(d))
+        return i if d[i] <= tol else None
 
     def set_cursor(self, raw_pt):
         self.cursor.setData(pos=self.to_scene(raw_pt) if raw_pt is not None else np.empty((0, 2)))
@@ -389,6 +434,7 @@ class Pane(QtWidgets.QWidget):
             return
         if not self.vb.sceneBoundingRect().contains(ev.scenePos()):
             return
+        self.last_click = ev.scenePos()
         p = self.vb.mapSceneToView(ev.scenePos())
         raw = self.to_raw([p.x(), p.y()])[0]
         self.clicked.emit(float(raw[0]), float(raw[1]))
@@ -396,6 +442,7 @@ class Pane(QtWidgets.QWidget):
     def _on_move(self, pos):
         if not self.vb.sceneBoundingRect().contains(pos):
             return
+        self.last_move = pos
         p = self.vb.mapSceneToView(pos)
         raw = self.to_raw([p.x(), p.y()])[0]
         self.hovered.emit(float(raw[0]), float(raw[1]))
@@ -422,7 +469,9 @@ class MainWindow(QtWidgets.QMainWindow):
         split.addWidget(self.R)
 
         self.list = QtWidgets.QListWidget()
+        self.list.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)      # keep arrow keys for nudging
         self.list.itemDoubleClicked.connect(self._jump_to_pair)
+        self.list.currentRowChanged.connect(self._list_row_changed)
         self.rms = QtWidgets.QLabel("Need 3 pairs to fit")
         self.rms.setWordWrap(True)
         side = QtWidgets.QWidget()
@@ -440,8 +489,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pairs = []                 # list of (xen_raw[2], if_raw[2])
         self.pending = {"L": None, "R": None}
         self.A = None                   # 3x3: Xenium px -> IF raw px
+        self.sel = None                 # selected pair index
         self._syncing = False
         self._active = "L"
+        # overlay placement: "float" (ghost follows mouse), "locked" (ghost pinned), "off"
+        self.g_state = "off"
+        self.g_theta = 0.0              # extra ghost rotation (rad), kept between placements
+        self.g_scale = 1.0              # extra ghost scale on top of the screen-zoom ratio
+        self.A_lock = None              # 3x3: Xenium px -> IF raw px while locked
+        self.lock_raw = None            # IF raw px where the ghost was locked (pivot for rotate/scale)
+        self._ghost_ok = False          # ghost has outlines to show
 
         tb = self.addToolBar("main")
         tb.setMovable(False)
@@ -459,7 +516,11 @@ class MainWindow(QtWidgets.QMainWindow):
         act("IF: flip ↕", lambda: self._orient(FLIP_V))
         act("IF: rotate 90°", lambda: self._orient(ROT_CW))
         tb.addSeparator()
-        self.a_kp = act("Add keypoints", self._mode_changed, "K", True)
+        self.a_ov = act("Overlay place", self._overlay_toggled, "O", True,
+                        "Float the Xenium nuclei over the IF image to place keypoints")
+        self.a_ov.setEnabled(self.bounds is not None)
+        self.a_kp = act("Pair clicks", self._mode_changed, "K", True,
+                        "Click a matching point in each pane")
         act("Undo", self._undo, "Ctrl+Z")
         act("Delete selected", self._delete_selected, "Delete")
         act("Clear", self._clear)
@@ -472,14 +533,34 @@ class MainWindow(QtWidgets.QMainWindow):
         act("Load keypoints…", self._load)
         act("Save…", self._save, "Ctrl+S")
 
+        def key(seq, slot):
+            QtGui.QShortcut(QtGui.QKeySequence(seq), self, activated=slot)
+
+        for name, (dx, dy) in {"Left": (-1, 0), "Right": (1, 0), "Up": (0, -1), "Down": (0, 1)}.items():
+            key(name, lambda dx=dx, dy=dy: self._nudge(dx, dy))
+            key("Shift+" + name, lambda dx=dx, dy=dy: self._nudge(10 * dx, 10 * dy))
+        key("[", lambda: self._ghost_adjust(rot=-math.radians(0.5)))
+        key("]", lambda: self._ghost_adjust(rot=math.radians(0.5)))
+        key("-", lambda: self._ghost_adjust(scale=1 / 1.005))
+        key("=", lambda: self._ghost_adjust(scale=1.005))
+        key("Escape", self._escape)
+
+        self.out_timer = QtCore.QTimer(self, singleShot=True, interval=120)
+        self.out_timer.timeout.connect(self._update_outlines)
+
         for side_, pane in (("L", self.L), ("R", self.R)):
             pane.clicked.connect(lambda x, y, s=side_: self._clicked(s, x, y))
             pane.hovered.connect(lambda x, y, s=side_: self._hovered(s, x, y))
             pane.settled.connect(self._update_outlines)
             pane.vb.sigRangeChanged.connect(lambda *a, s=side_: self._range_changed(s))
+            pane.vb.sigRangeChanged.connect(lambda *a: self._update_ghost())
+        self.L.settled.connect(self._reload_ghost)
 
         self.resize(1700, 950)
-        self.statusBar().showMessage("Orient the IF image, then press K and click matching points (left & right).")
+        self.statusBar().showMessage(
+            "Orient the IF image, zoom both panes to a similar scale, then press O (overlay place)."
+            if self.bounds is not None else
+            "Orient the IF image, then press K and click matching points (left & right).")
 
     # ---------------------------------------------------------------- transforms
     def _scene_map(self, src):
@@ -487,7 +568,19 @@ class MainWindow(QtWidgets.QMainWindow):
         M = self.R.O @ self.A @ np.linalg.inv(self.L.O)     # L scene -> R scene
         return M if src == "L" else np.linalg.inv(M)
 
+    def _current_map(self):
+        """Best available Xenium px -> IF raw px mapping (fit, locked ghost or floating ghost)."""
+        if self.A is not None:
+            return self.A
+        if self.g_state == "locked":
+            return self.A_lock
+        if self.g_state == "float":
+            G = self._float_G()
+            return None if G is None else np.linalg.inv(self.R.O) @ G
+        return None
+
     def _fit(self):
+        was_fitted = self.A is not None
         if len(self.pairs) < 3:
             self.A = None
             self.a_link.setChecked(False)
@@ -503,6 +596,8 @@ class MainWindow(QtWidgets.QMainWindow):
         A[1, :] = P[:, 1]
         if abs(np.linalg.det(A[:2, :2])) < 1e-12:
             self.A = None
+            self.a_link.setChecked(False)
+            self.a_link.setEnabled(False)
             self.rms.setText("Degenerate fit (points collinear?) — spread them out")
             return
         self.A = A
@@ -516,51 +611,126 @@ class MainWindow(QtWidgets.QMainWindow):
         note = "" if len(self.pairs) > 3 else " (exactly 3 pairs: residuals are always 0 — add more)"
         self.rms.setText(f"RMS residual: <b>{rms:.2f} µm</b> · max {self._res_um.max():.2f} µm{note}<br>"
                          f"scale x {sx:.4f}, y {sy:.4f} (IF px per Xenium px) · rotation {rot:.2f}°")
+        if not was_fitted:                                    # first fit: link views + show overlay
+            self.a_link.setChecked(True)
+            if self.bounds is not None:
+                self.a_nuc.setChecked(True)
 
     # ---------------------------------------------------------------- keypoints
     def _mode_changed(self, on):
-        self.statusBar().showMessage("Keypoint mode: click a point in each pane (any order)." if on
-                                     else "Keypoint mode off.")
+        if on:
+            self.a_ov.setChecked(False)
+        self.statusBar().showMessage("Pair-click mode: click a point in each pane (any order)." if on
+                                     else "Pair-click mode off.")
 
-    def _clicked(self, side, x, y):
-        if not self.a_kp.isChecked():
-            return
-        self.pending[side] = np.array([x, y])
-        if self.pending["L"] is not None and self.pending["R"] is not None:
-            self.pairs.append((self.pending["L"], self.pending["R"]))
-            self.pending = {"L": None, "R": None}
-            self._fit()
+    def _add_pair(self, xen, ifp):
+        self.pairs.append((np.asarray(xen, float), np.asarray(ifp, float)))
+        self.sel = len(self.pairs) - 1
+        self._pairs_changed()
+
+    def _pairs_changed(self):
+        if self.sel is not None and self.sel >= len(self.pairs):
+            self.sel = len(self.pairs) - 1 if self.pairs else None
+        self._fit()
+        self._sync_ghost_state()
         self._redraw_keypoints()
 
+    def _clicked(self, side, x, y):
+        pane = self.L if side == "L" else self.R
+        if self.a_kp.isChecked():
+            self.pending[side] = np.array([x, y])
+            if self.pending["L"] is not None and self.pending["R"] is not None:
+                self.pending, (a, b) = {"L": None, "R": None}, (self.pending["L"], self.pending["R"])
+                self._add_pair(a, b)
+            else:
+                self._redraw_keypoints()
+            return
+        if self.a_ov.isChecked() and self.g_state == "float":
+            if side == "R":
+                self._lock_ghost(x, y)
+            return
+        if self.a_ov.isChecked() and self.g_state == "locked":
+            if side == "R":
+                xen = apply(np.linalg.inv(self.A_lock), [[x, y]])[0]
+                self.g_state = "float"
+                self._add_pair(xen, [x, y])
+                n = len(self.pairs)
+                self.statusBar().showMessage(
+                    f"Keypoint {n} placed. Pan the Xenium pane to a different region and match again "
+                    f"({3 - n} more needed)." if self.A is None else
+                    "3 keypoints placed: views linked. Select a keypoint and nudge it with the arrow keys; "
+                    "click elsewhere to add more.")
+            return
+        # selection, or (overlay mode with a fit) add a keypoint on the current fit
+        i = pane.hit(np.array([p[0 if side == "L" else 1] for p in self.pairs]).reshape(-1, 2), pane.last_click)
+        if i is not None:
+            self.sel = i
+            self._redraw_keypoints()
+            self.statusBar().showMessage(f"Keypoint #{i + 1} selected — arrow keys nudge its IF position "
+                                         f"(Shift = 10 px).")
+        elif self.a_ov.isChecked() and self.A is not None:
+            p = np.array([x, y])
+            if side == "L":
+                self._add_pair(p, apply(self.A, [p])[0])
+            else:
+                self._add_pair(apply(np.linalg.inv(self.A), [p])[0], p)
+            self.statusBar().showMessage(f"Keypoint #{self.sel + 1} added on the current fit — "
+                                         f"nudge it with the arrow keys until the outlines match.")
+
     def _redraw_keypoints(self):
-        self.L.set_keypoints(np.array([p[0] for p in self.pairs]).reshape(-1, 2), self.pending["L"])
-        self.R.set_keypoints(np.array([p[1] for p in self.pairs]).reshape(-1, 2), self.pending["R"])
+        L_pts = np.array([p[0] for p in self.pairs]).reshape(-1, 2)
+        R_pts = np.array([p[1] for p in self.pairs]).reshape(-1, 2)
+        self.L.set_keypoints(L_pts, self.pending["L"], self.sel)
+        self.R.set_keypoints(R_pts, self.pending["R"], self.sel)
+        self.list.blockSignals(True)
         self.list.clear()
         for i, (a, b) in enumerate(self.pairs):
             res = f"   {self._res_um[i]:.2f} µm" if self.A is not None and len(self.pairs) > 3 else ""
             self.list.addItem(f"#{i + 1}  X({a[0]:.0f},{a[1]:.0f})  IF({b[0]:.0f},{b[1]:.0f}){res}")
-        self._update_outlines()
+        self.list.setCurrentRow(-1 if self.sel is None else self.sel)
+        self.list.blockSignals(False)
+        # re-map the drawn outlines right away; re-select which nuclei to draw a moment later
+        if self.A is not None:
+            self.R.outline.setTransform(qtransform(self.R.O @ self.A))
+        self.out_timer.start()
 
-    def _undo(self):
-        if self.pending["L"] is not None or self.pending["R"] is not None:
-            self.pending = {"L": None, "R": None}
-        elif self.pairs:
-            self.pairs.pop()
-            self._fit()
+    def _list_row_changed(self, row):
+        self.sel = row if row >= 0 else None
         self._redraw_keypoints()
 
-    def _delete_selected(self):
-        rows = sorted({self.list.row(i) for i in self.list.selectedItems()}, reverse=True)
-        for r in rows:
-            self.pairs.pop(r)
-        if rows:
+    def _nudge(self, dx, dy):
+        """Arrow keys: move the locked ghost, else the selected keypoint's IF position (screen px)."""
+        upp = float(np.mean(self.R.vb.viewPixelSize()))
+        d = np.array([dx, dy]) * upp                                  # in IF scene units
+        if self.a_ov.isChecked() and self.g_state == "locked":
+            self.A_lock = np.linalg.inv(self.R.O) @ T(*d) @ self.R.O @ self.A_lock
+            self._update_ghost()
+        elif self.sel is not None:
+            a, b = self.pairs[self.sel]
+            self.pairs[self.sel] = (a, b + np.linalg.inv(self.R.O)[:2, :2] @ d)
             self._fit()
             self._redraw_keypoints()
 
+    def _undo(self):
+        if self.g_state == "locked":
+            self._escape()
+            return
+        if self.pending["L"] is not None or self.pending["R"] is not None:
+            self.pending = {"L": None, "R": None}
+            self._redraw_keypoints()
+        elif self.pairs:
+            self.pairs.pop()
+            self._pairs_changed()
+
+    def _delete_selected(self):
+        if self.sel is not None:
+            self.pairs.pop(self.sel)
+            self.sel = None
+            self._pairs_changed()
+
     def _clear(self):
-        self.pairs, self.pending = [], {"L": None, "R": None}
-        self._fit()
-        self._redraw_keypoints()
+        self.pairs, self.pending, self.sel = [], {"L": None, "R": None}, None
+        self._pairs_changed()
 
     def _jump_to_pair(self, item):
         a, b = self.pairs[self.list.row(item)]
@@ -569,10 +739,104 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.a_link.isChecked():
             self.R.center_on(b)
 
+    # ---------------------------------------------------------------- overlay placement (ghost)
+    def _overlay_toggled(self, on):
+        if on:
+            self.a_kp.setChecked(False)
+            self.g_state = "float" if self.A is None else "off"
+            self._reload_ghost()
+            self.statusBar().showMessage(
+                "Overlay mode: move the mouse over the IF pane — the Xenium nuclei follow it. Click when they "
+                "match ([ ] rotate, - = scale, wheel zooms the IF)." if self.A is None else
+                "Overlay mode: click to add a keypoint on the current fit, or click a keypoint to select it; "
+                "arrow keys nudge.")
+        else:
+            self.g_state = "off"
+            self.statusBar().showMessage("Overlay mode off.")
+        self._update_ghost()
+
+    def _sync_ghost_state(self):
+        if not self.a_ov.isChecked():
+            self.g_state = "off"
+        elif self.A is not None and self.g_state == "float":
+            self.g_state = "off"
+        elif self.A is None and self.g_state == "off":
+            self.g_state = "float"
+            self._reload_ghost()
+        self._update_ghost()
+
+    def _reload_ghost(self):
+        """Ghost = Xenium nuclei currently visible in the left pane (re-read when it settles)."""
+        if self.g_state != "float" or self.bounds is None:
+            return
+        res, n = self.bounds.select(*self.L.visible_raw_bbox())
+        self.R.set_ghost(res)
+        self._ghost_ok = res is not None
+        if res is None:
+            self.statusBar().showMessage(
+                f"{n} nuclei in the Xenium view — zoom the Xenium pane in to float them." if n else
+                "No nuclei in the Xenium view — pan the Xenium pane onto tissue.")
+        self._update_ghost()
+
+    def _float_G(self):
+        """Xenium px -> IF scene while floating: left-pane centre under the IF mouse position,
+        scaled by the ratio of the two panes' screen zooms (plus the manual rotation/scale)."""
+        if self.R.last_move is None:
+            return None
+        m = self.R.vb.mapSceneToView(self.R.last_move)
+        c = self.L.vb.viewRect().center()
+        k = float(np.mean(self.R.vb.viewPixelSize())) / float(np.mean(self.L.vb.viewPixelSize())) * self.g_scale
+        return T(m.x(), m.y()) @ Rot(self.g_theta) @ S(k, k) @ T(-c.x(), -c.y()) @ self.L.O
+
+    def _update_ghost(self):
+        G = None
+        if self.g_state == "float" and getattr(self, "_ghost_ok", False):
+            G = self._float_G()
+        elif self.g_state == "locked":
+            G = self.R.O @ self.A_lock
+        if G is None:
+            self.R.ghost.hide()
+        else:
+            self.R.ghost.setTransform(qtransform(G))
+            self.R.ghost.show()
+
+    def _lock_ghost(self, x, y):
+        if not getattr(self, "_ghost_ok", False) or self._float_G() is None:
+            return
+        self.A_lock = np.linalg.inv(self.R.O) @ self._float_G()
+        self.lock_raw = np.array([x, y])
+        self.g_state = "locked"
+        self._update_ghost()
+        self.statusBar().showMessage("Overlay locked (arrows nudge, [ ] rotate, - = scale, Esc unlocks). "
+                                     "Now click the spot you are most confident about to place the keypoint.")
+
+    def _ghost_adjust(self, rot=0.0, scale=1.0):
+        if self.g_state == "off":
+            return
+        self.g_theta += rot
+        self.g_scale *= scale
+        if self.g_state == "locked":
+            q = self.R.to_scene(self.lock_raw)[0]
+            X = T(*q) @ Rot(rot) @ S(scale, scale) @ T(*-q)
+            self.A_lock = np.linalg.inv(self.R.O) @ X @ self.R.O @ self.A_lock
+        self._update_ghost()
+        self.statusBar().showMessage(f"Ghost rotation {math.degrees(self.g_theta):+.1f}° · "
+                                     f"extra scale {self.g_scale:.3f}")
+
+    def _escape(self):
+        if self.g_state == "locked":
+            self.g_state = "float"
+            self._reload_ghost()
+            self.statusBar().showMessage("Overlay unlocked — it follows the mouse again.")
+        elif self.pending["L"] is not None or self.pending["R"] is not None:
+            self.pending = {"L": None, "R": None}
+            self._redraw_keypoints()
+
     # ---------------------------------------------------------------- linking / cursor
     def _orient(self, F):
         self.R.set_orientation(F @ self.R.O)
         self._redraw_keypoints()
+        self._update_ghost()
 
     def _link_toggled(self, on):
         if on:
@@ -597,45 +861,47 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _hovered(self, side, x, y):
         self._active = side
+        if side == "R" and self.g_state == "float":
+            self._update_ghost()
         src, dst = (self.L, self.R) if side == "L" else (self.R, self.L)
         src.set_cursor(None)
-        xen = np.array([x, y]) if side == "L" else (apply(np.linalg.inv(self.A), [[x, y]])[0]
-                                                   if self.A is not None else None)
-        if self.A is not None:
-            other = apply(self.A, [[x, y]])[0] if side == "L" else xen
+        A = self._current_map()
+        xen = np.array([x, y]) if side == "L" else (apply(np.linalg.inv(A), [[x, y]])[0]
+                                                   if A is not None else None)
+        if A is not None:
+            other = apply(A, [[x, y]])[0] if side == "L" else xen
             dst.set_cursor(other)
         else:
             dst.set_cursor(None)
         msg = f"Xenium: ({xen[0]:.1f}, {xen[1]:.1f}) px = ({xen[0] * self.px_um:.1f}, {xen[1] * self.px_um:.1f}) µm" \
             if xen is not None else f"IF raw: ({x:.1f}, {y:.1f}) px"
         if self.a_kp.isChecked():
-            msg = "[KEYPOINT MODE]  " + msg
+            msg = "[PAIR-CLICK MODE]  " + msg
+        elif self.g_state in ("float", "locked"):
+            msg = f"[OVERLAY {self.g_state.upper()} · keypoint {len(self.pairs) + 1}]  " + msg
         self.statusBar().showMessage(msg)
 
     # ---------------------------------------------------------------- nuclei overlay
     def _update_outlines(self, *a):
         if self.bounds is None or not self.a_nuc.isChecked():
-            self.L.set_outline(None, None)
-            self.R.set_outline(None, None)
+            self.L.set_outline(None)
+            self.R.set_outline(None)
             return
         # left: directly in Xenium px
         res, n = self.bounds.select(*self.L.visible_raw_bbox())
-        self.L.set_outline(None if res is None else self.L.to_scene(res[0]), None if res is None else res[1])
+        self.L.set_outline(res, self.L.O)
         msgs = [] if res is not None or n == 0 else [f"left: {n} nuclei in view — zoom in to draw"]
-        # right: through the affine
+        # right: through the affine (vertices stay in Xenium px; the item transform does the mapping)
         if self.A is None:
-            self.R.set_outline(None, None)
+            self.R.set_outline(None)
         else:
             Ainv = np.linalg.inv(self.A)
             x0, y0, x1, y1 = self.R.visible_raw_bbox()
             xb = bbox(apply(Ainv, [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]))
             res, n = self.bounds.select(*xb)
-            if res is None:
-                self.R.set_outline(None, None)
-                if n:
-                    msgs.append(f"right: {n} nuclei in view — zoom in to draw")
-            else:
-                self.R.set_outline(self.R.to_scene(apply(self.A, res[0])), res[1])
+            self.R.set_outline(res, self.R.O @ self.A)
+            if res is None and n:
+                msgs.append(f"right: {n} nuclei in view — zoom in to draw")
         if msgs:
             self.statusBar().showMessage(" · ".join(msgs))
 
@@ -681,9 +947,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def load_keypoints(self, p):
         a = np.loadtxt(p, delimiter=",", skiprows=1, ndmin=2)
         self.pairs = [(r[0:2].copy(), r[2:4].copy()) for r in a]
-        self.pending = {"L": None, "R": None}
-        self._fit()
-        self._redraw_keypoints()
+        self.pending, self.sel = {"L": None, "R": None}, None
+        self._pairs_changed()
 
 
 def main():

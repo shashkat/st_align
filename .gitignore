@@ -1,3 +1,7 @@
 morphology_focus
+example1
+example2
 nucleus_boundaries.parquet
 SP25_02644_r1.ome.tif
+.DS_Store
+__pycache__
