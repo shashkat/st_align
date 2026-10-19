@@ -1,0 +1,26 @@
+[project]
+name = "st-align"
+version = "0.1.0"
+description = "Align spatial transcriptomics (Xenium) data with a post-Xenium IF or H&E image of the same section"
+authors = [
+    { name = "Shashank Katiyar", email = "shashanksk31@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    # GUI
+    "pyqt6>=6.11.0",
+    "pyqtgraph>=0.14.0",
+    # image I/O: pyramidal / multi-file OME-TIFF, read lazily via zarr
+    "tifffile>=2026.10.15",
+    "zarr>=3.4.1",
+    "imagecodecs>=2026.10.10",   # compressed TIFF tiles (Xenium morphology images are JPEG2000)
+    # nucleus / cell boundaries (.parquet)
+    "pandas>=3.0.6",
+    "pyarrow>=26.0.0",
+    "numpy>=2.5.4",
+    # automatic alignment (SIFT); headless build avoids clashing with PyQt6's Qt
+    "opencv-python-headless>=5.0.0.93",
+]
+
+[tool.uv]
+package = false   # a script (python main.py), not an installable package
