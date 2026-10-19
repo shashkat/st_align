@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-xalign — two-pane prototype for aligning a post-Xenium IF image to the Xenium DAPI image.
+st_align — two-pane prototype for aligning a post-Xenium IF image to the Xenium DAPI image.
 
 Left pane  : Xenium morphology image (fixed), e.g. morphology_focus/morphology_focus_0000.ome.tif
 Right pane : post-Xenium IF image (moving), any OME-TIFF / TIFF (pyramidal strongly recommended)
@@ -61,7 +61,7 @@ XENIUM_PX_UM = 0.2125    # Xenium morphology level-0 pixel size (µm)
 # keypoints.csv columns, as exported/imported by Xenium Explorer's image alignment:
 # fixed = Xenium morphology level-0 px, alignment = raw level-0 px of the aligned (IF / H&E) image
 KP_COLS = ("fixedX", "fixedY", "alignmentX", "alignmentY")
-KP_COLS_OLD = ("xenium_x_px", "xenium_y_px", "if_x_px", "if_y_px")   # earlier xalign files
+KP_COLS_OLD = ("xenium_x_px", "xenium_y_px", "if_x_px", "if_y_px")   # files saved by earlier versions of st_align
 GAMMA_MAX = 5.0          # gamma slider spans 1/GAMMA_MAX .. GAMMA_MAX
 
 
@@ -594,7 +594,7 @@ class Pane(QtWidgets.QWidget):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, xen_path, if_path, boundaries_path=None, px_um=None):
         super().__init__()
-        self.setWindowTitle("xalign — Xenium ↔ post-Xenium IF")
+        self.setWindowTitle("st_align — Xenium ↔ post-Xenium IF")
         self.xen = PyramidImage(xen_path)
         self.ifim = PyramidImage(if_path)
         self.px_um = px_um or self.xen.pixel_size or XENIUM_PX_UM
@@ -1148,8 +1148,8 @@ class StartDialog(QtWidgets.QDialog):
 
     def __init__(self, initial=None):
         super().__init__()
-        self.setWindowTitle("xalign — choose files")
-        self.settings = QtCore.QSettings("xalign", "xalign")
+        self.setWindowTitle("st_align — choose files")
+        self.settings = QtCore.QSettings("st_align", "st_align")
         self.edits = {}
         grid = QtWidgets.QGridLayout()
         grid.setColumnStretch(1, 1)
@@ -1248,7 +1248,7 @@ def main():
     ap.add_argument("--keypoints", help="keypoints.csv (Xenium Explorer format: fixedX,fixedY,alignmentX,alignmentY)")
     args = ap.parse_args()
 
-    app = pg.mkQApp("xalign")
+    app = pg.mkQApp("st_align")
     if args.xenium and args.if_path:                            # everything given: start directly
         w = launch(args.xenium, args.if_path, args.boundaries, args.keypoints, args.pixel_size)
         sys.exit(app.exec())
