@@ -31,8 +31,10 @@ Keys:  O overlay place · K pair-click mode · L link · N nuclei · M mirror cu
        Select a keypoint in the list (or click it with overlay mode off); double-click to jump to it.
 
 Run:
-  python xalign.py --xenium morphology_focus_0000.ome.tif --if post_if.ome.tif \\
-                   --boundaries nucleus_boundaries.parquet
+  python main.py                 # opens a start window to pick the files
+  python main.py --xenium morphology_focus/ch0000_dapi.ome.tif --if post_if.ome.tif \\
+                 --boundaries nucleus_boundaries.parquet      # starts the aligner directly
+  (Giving only some of the paths opens the start window with those filled in.)
 """
 import argparse
 import csv
@@ -1126,20 +1128,146 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pairs_changed()
 
 
+# ----------------------------------------------------------------------------- start window
+class StartDialog(QtWidgets.QDialog):
+    """Pick the input files, then "Start Aligner". Last-used paths are remembered."""
+
+    IMAGES = "Images (*.ome.tif *.ome.tiff *.tif *.tiff);;All files (*)"
+    FIELDS = [  # key, label, hint, file filter, required
+        ("xenium", "Xenium morphology image",
+         "e.g. morphology_focus/ch0000_dapi.ome.tif — the other channels in the folder are found automatically",
+         IMAGES, True),
+        ("if_path", "Post-Xenium image (IF / H&E)", "TIFF / OME-TIFF; pyramidal is much faster", IMAGES, True),
+        ("boundaries", "Nucleus segmentation",
+         "nucleus_boundaries.parquet (or cell_boundaries.parquet) — needed for the nuclei overlay",
+         "Parquet (*.parquet);;All files (*)", False),
+        ("keypoints", "Keypoints to resume (optional)",
+         "keypoints.csv from this tool or Xenium Explorer (fixedX,fixedY,alignmentX,alignmentY)",
+         "CSV (*.csv);;All files (*)", False),
+    ]
+
+    def __init__(self, initial=None):
+        super().__init__()
+        self.setWindowTitle("xalign — choose files")
+        self.settings = QtCore.QSettings("xalign", "xalign")
+        self.edits = {}
+        grid = QtWidgets.QGridLayout()
+        grid.setColumnStretch(1, 1)
+        for row, (key, label, hint, filt, required) in enumerate(self.FIELDS):
+            lbl = QtWidgets.QLabel(f"<b>{label}</b><br>"
+                                   f"<span style='color:gray'>{hint}</span>")
+            lbl.setWordWrap(True)
+            edit = QtWidgets.QLineEdit()
+            edit.setMinimumWidth(480)
+            edit.setPlaceholderText("required" if required else "optional")
+            edit.textChanged.connect(self._validate)
+            btn = QtWidgets.QPushButton("Browse…")
+            btn.clicked.connect(lambda _=False, k=key, l=label, f=filt: self._browse(k, l, f))
+            grid.addWidget(lbl, 2 * row, 0, 1, 3)
+            grid.addWidget(edit, 2 * row + 1, 0, 1, 2)
+            grid.addWidget(btn, 2 * row + 1, 2)
+            self.edits[key] = edit
+        self.edits["xenium"].textChanged.connect(self._guess_boundaries)
+
+        self.msg = QtWidgets.QLabel("")
+        self.msg.setStyleSheet("color: #c0392b")
+        self.msg.setWordWrap(True)
+        buttons = QtWidgets.QDialogButtonBox()
+        self.start = buttons.addButton("Start Aligner", QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole)
+        self.start.setDefault(True)
+        buttons.addButton("Quit", QtWidgets.QDialogButtonBox.ButtonRole.RejectRole)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.addLayout(grid)
+        lay.addWidget(self.msg)
+        lay.addWidget(buttons)
+
+        for key, edit in self.edits.items():                     # command line first, else last session
+            edit.setText((initial or {}).get(key) or self.settings.value(key, "", str))
+        self._guess_boundaries(self.edits["xenium"].text())     # after all fields are filled
+        self._validate()
+
+    def values(self):
+        return {k: e.text().strip() or None for k, e in self.edits.items()}
+
+    def remember(self):
+        for k, v in self.values().items():
+            self.settings.setValue(k, v or "")
+
+    def _browse(self, key, label, filt):
+        cur = self.edits[key].text().strip()
+        start = cur or next((v for v in self.values().values() if v), "")
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, label, os.path.dirname(start) if start else "", filt)
+        if p:
+            self.edits[key].setText(p)
+
+    def _guess_boundaries(self, path):
+        """Xenium output layout: <out>/morphology_focus/chXXXX.ome.tif + <out>/nucleus_boundaries.parquet."""
+        if self.edits["boundaries"].text().strip() or not path.strip():
+            return
+        d = os.path.dirname(path.strip())
+        for cand in (os.path.join(os.path.dirname(d), "nucleus_boundaries.parquet"),
+                     os.path.join(d, "nucleus_boundaries.parquet")):
+            if os.path.isfile(cand):
+                self.edits["boundaries"].setText(cand)
+                return
+
+    def _validate(self, *a):
+        problems = []
+        for key, label, _, _, required in self.FIELDS:
+            v = self.edits[key].text().strip()
+            if not v and required:
+                problems.append(f"{label}: required")
+            elif v and not os.path.isfile(v):
+                problems.append(f"{label}: file not found")
+        if not problems and not self.edits["boundaries"].text().strip():
+            self.msg.setStyleSheet("color: gray")
+            self.msg.setText("No segmentation file: overlay placement and the nuclei overlay will be unavailable.")
+        else:
+            self.msg.setStyleSheet("color: #c0392b")
+            self.msg.setText(" · ".join(problems))
+        self.start.setEnabled(not problems)
+
+
+def launch(xenium, if_path, boundaries=None, keypoints=None, pixel_size=None):
+    w = MainWindow(xenium, if_path, boundaries, pixel_size)
+    if keypoints:
+        w.load_keypoints(keypoints)
+    w.show()
+    return w
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--xenium", required=True, help="Xenium morphology OME-TIFF (DAPI)")
-    ap.add_argument("--if", dest="if_path", required=True, help="post-Xenium IF image (TIFF/OME-TIFF)")
+    ap.add_argument("--xenium", help="Xenium morphology OME-TIFF (DAPI)")
+    ap.add_argument("--if", dest="if_path", help="post-Xenium IF / H&E image (TIFF/OME-TIFF)")
     ap.add_argument("--boundaries", help="nucleus_boundaries.parquet (optional, for the overlay)")
     ap.add_argument("--pixel-size", type=float, help=f"Xenium µm/px (default: from OME, else {XENIUM_PX_UM})")
     ap.add_argument("--keypoints", help="keypoints.csv (Xenium Explorer format: fixedX,fixedY,alignmentX,alignmentY)")
     args = ap.parse_args()
 
     app = pg.mkQApp("xalign")
-    w = MainWindow(args.xenium, args.if_path, args.boundaries, args.pixel_size)
-    if args.keypoints:
-        w.load_keypoints(args.keypoints)
-    w.show()
+    if args.xenium and args.if_path:                            # everything given: start directly
+        w = launch(args.xenium, args.if_path, args.boundaries, args.keypoints, args.pixel_size)
+        sys.exit(app.exec())
+
+    dlg = StartDialog({"xenium": args.xenium, "if_path": args.if_path,
+                       "boundaries": args.boundaries, "keypoints": args.keypoints})
+    while True:
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        try:
+            w = launch(**dlg.values(), pixel_size=args.pixel_size)
+        except Exception as e:                                  # unreadable file etc.: back to the dialog
+            QtWidgets.QApplication.restoreOverrideCursor()
+            QtWidgets.QMessageBox.critical(dlg, "Could not start", f"{type(e).__name__}: {e}")
+            continue
+        QtWidgets.QApplication.restoreOverrideCursor()
+        dlg.remember()
+        break
     sys.exit(app.exec())
 
 
