@@ -35,6 +35,7 @@ Run:
   python main.py --xenium morphology_focus/ch0000_dapi.ome.tif --if post_if.ome.tif \\
                  --boundaries nucleus_boundaries.parquet      # starts the aligner directly
   (Giving only some of the paths opens the start window with those filled in.)
+  Closing the aligner window returns to the start window; quitting the start window quits.
 """
 import argparse
 import csv
@@ -592,6 +593,8 @@ class Pane(QtWidgets.QWidget):
 
 # ----------------------------------------------------------------------------- main window
 class MainWindow(QtWidgets.QMainWindow):
+    closed = QtCore.Signal()
+
     def __init__(self, xen_path, if_path, boundaries_path=None, px_um=None):
         super().__init__()
         self.setWindowTitle("st_align — Xenium ↔ post-Xenium IF")
@@ -1070,6 +1073,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if msgs:
             self.statusBar().showMessage(" · ".join(msgs))
 
+    def closeEvent(self, ev):
+        super().closeEvent(ev)
+        self.closed.emit()
+
     # ---------------------------------------------------------------- I/O
     def _save(self):
         if self.A is None:
@@ -1239,6 +1246,54 @@ def launch(xenium, if_path, boundaries=None, keypoints=None, pixel_size=None):
     return w
 
 
+class Session(QtCore.QObject):
+    """Start window -> aligner -> start window ... ; quitting the start window (or the app) quits."""
+
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.w = None
+        self.quitting = False
+        self.dlg = StartDialog({"xenium": args.xenium, "if_path": args.if_path,
+                                "boundaries": args.boundaries, "keypoints": args.keypoints})
+        self.dlg.accepted.connect(lambda: self._launch(self.dlg.values(), from_dlg=True))
+        self.dlg.rejected.connect(QtWidgets.QApplication.quit)
+        QtWidgets.QApplication.instance().installEventFilter(self)
+
+    def eventFilter(self, obj, ev):                 # app-wide quit (Cmd+Q / "Quit" menu): don't reopen
+        if ev.type() == QtCore.QEvent.Type.Quit and obj is QtWidgets.QApplication.instance():
+            self.quitting = True
+        return False
+
+    def start(self):
+        a = self.args
+        if a.xenium and a.if_path:                  # everything given on the command line: start directly
+            self._launch({"xenium": a.xenium, "if_path": a.if_path, "boundaries": a.boundaries,
+                          "keypoints": a.keypoints}, from_dlg=False)
+        else:
+            self.dlg.show()
+
+    def _launch(self, files, from_dlg):
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        try:
+            self.w = launch(**files, pixel_size=self.args.pixel_size)
+        except Exception as e:                      # unreadable file etc.: back to the start window
+            QtWidgets.QApplication.restoreOverrideCursor()
+            QtWidgets.QMessageBox.critical(None, "Could not start", f"{type(e).__name__}: {e}")
+            self.dlg.show()
+            return
+        QtWidgets.QApplication.restoreOverrideCursor()
+        if from_dlg:
+            self.dlg.remember()
+        self.w.closed.connect(self._aligner_closed)
+
+    def _aligner_closed(self):
+        self.w.deleteLater()                        # free the images
+        self.w = None
+        # deferred, so an app-wide quit that is closing all windows finishes first
+        QtCore.QTimer.singleShot(0, lambda: None if self.quitting else self.dlg.show())
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--xenium", help="Xenium morphology OME-TIFF (DAPI)")
@@ -1249,25 +1304,9 @@ def main():
     args = ap.parse_args()
 
     app = pg.mkQApp("st_align")
-    if args.xenium and args.if_path:                            # everything given: start directly
-        w = launch(args.xenium, args.if_path, args.boundaries, args.keypoints, args.pixel_size)
-        sys.exit(app.exec())
-
-    dlg = StartDialog({"xenium": args.xenium, "if_path": args.if_path,
-                       "boundaries": args.boundaries, "keypoints": args.keypoints})
-    while True:
-        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-            return
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
-        try:
-            w = launch(**dlg.values(), pixel_size=args.pixel_size)
-        except Exception as e:                                  # unreadable file etc.: back to the dialog
-            QtWidgets.QApplication.restoreOverrideCursor()
-            QtWidgets.QMessageBox.critical(dlg, "Could not start", f"{type(e).__name__}: {e}")
-            continue
-        QtWidgets.QApplication.restoreOverrideCursor()
-        dlg.remember()
-        break
+    app.setQuitOnLastWindowClosed(False)            # closing the aligner returns to the start window
+    session = Session(args)
+    session.start()
     sys.exit(app.exec())
 
 
