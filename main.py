@@ -20,13 +20,16 @@ Workflow (overlay placement, needs --boundaries)
      keypoint 4, 5, ... (with linked views, use - / = rather than the wheel to adjust the scale).
      To refine an existing keypoint, pick it in the list (or turn overlay mode off and click it) and
      use the arrow keys to nudge its IF position: the red overlay updates immediately.
+  Automatic: after step 1, press A (Auto-align…) to place keypoints automatically (SIFT feature
+     matching as in InSituPy, then per-keypoint refinement), then review them as in step 4.
+     Needs OpenCV (pip install opencv-python-headless).
   5. Save (Ctrl+S) writes keypoints + both affine directions to a folder of your choice.
      keypoints.csv uses Xenium Explorer's format (fixedX,fixedY,alignmentX,alignmentY: Xenium px,
      raw IF px), so it can be imported there, and Xenium Explorer exports can be loaded here.
 
 Classic placement: press K and click matching points, one click in each pane = one pair.
 
-Keys:  O overlay place · K pair-click mode · L link · N nuclei · M mirror cursor · arrows nudge (Shift x10)
+Keys:  A auto-align · O overlay place · K pair-click mode · L link · N nuclei · M mirror cursor · arrows nudge (Shift x10)
        [ ] rotate ghost · - = scale ghost · Esc unlock · Ctrl+Z undo · Del delete selected · Ctrl+S save
        Select a keypoint in the list (or click it with overlay mode off); double-click to jump to it.
 
@@ -50,6 +53,8 @@ import tifffile
 import zarr
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+
+import autoalign
 
 pg.setConfigOptions(imageAxisOrder="row-major", antialias=False)
 
@@ -660,6 +665,7 @@ class MainWindow(QtWidgets.QMainWindow):
         act("IF: flip ↔", lambda: self._orient(FLIP_H))
         act("IF: flip ↕", lambda: self._orient(FLIP_V))
         act("IF: rotate 90°", lambda: self._orient(ROT_CW))
+        act("Auto-align…", self._auto_align, "A", tip="Place keypoints automatically (feature matching)")
         tb.addSeparator()
         self.a_ov = act("Overlay place", self._overlay_toggled, "O", True,
                         "Float the Xenium nuclei over the IF image to place keypoints")
@@ -979,6 +985,82 @@ class MainWindow(QtWidgets.QMainWindow):
             self._redraw_keypoints()
 
     # ---------------------------------------------------------------- linking / cursor
+    def _auto_align(self):
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Automatic alignment")
+        form = QtWidgets.QFormLayout(dlg)
+        gray = "<span style='color:gray'>{}</span>"
+        form.addRow("Xenium channel:", QtWidgets.QLabel(
+            f"{self.xen.channel_names[self.xen.channel]}  " + gray.format("(shown in the Xenium pane; DAPI works best)")))
+        mode = QtWidgets.QComboBox()
+        if self.ifim.rgb:
+            for key, label in autoalign.IF_MODES.items():
+                mode.addItem(label, key)
+        else:
+            mode.addItem(f"{self.ifim.channel_names[self.ifim.channel]} (shown in the IF pane)", "gray")
+            mode.setEnabled(False)
+        form.addRow("IF channel:", mode)
+        n = QtWidgets.QSpinBox()
+        n.setRange(3, 100)
+        n.setValue(12)
+        form.addRow("Keypoints to place:", n)
+        replace = QtWidgets.QCheckBox(f"Replace the {len(self.pairs)} existing keypoint(s)")
+        replace.setChecked(True)
+        if self.pairs:
+            form.addRow("", replace)
+        note = QtWidgets.QLabel(gray.format(
+            "Rotation is found automatically, so the IF pane only needs to be the right way round (not mirrored). "
+            "If it doesn't match as shown, the mirror image is tried too."))
+        note.setWordWrap(True)
+        form.addRow(note)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok |
+                                             QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setText("Run")
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+
+        prog = QtWidgets.QProgressDialog("Starting…", None, 0, 100, self)
+        prog.setWindowTitle("Automatic alignment")
+        prog.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.show()
+
+        def progress(text, frac):
+            prog.setLabelText(text)
+            prog.setValue(int(frac * 100))
+            QtWidgets.QApplication.processEvents()
+
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        try:
+            r = autoalign.auto_keypoints(self.xen, self.ifim, self.R.O, mode.currentData(), n.value(), progress)
+        except autoalign.AutoAlignError as e:
+            r, err = None, str(e)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            prog.close()
+        if r is None:
+            QtWidgets.QMessageBox.warning(self, "Automatic alignment failed", err)
+            return
+
+        if r["mirrored"]:
+            self._orient(FLIP_H)                    # show the IF the way round it actually matched
+        if self.pairs and replace.isChecked():
+            self.pairs = []
+        self.pairs += r["pairs"]
+        self.pending, self.sel = {"L": None, "R": None}, None
+        self._pairs_changed()
+        msg = (f"Placed {len(r['pairs'])} keypoints ({r['n_inliers']} consistent feature matches; "
+               f"{r['tried'] - len(r['pairs'])} candidate(s) dropped in refinement).")
+        if r["mirrored"]:
+            msg += "\n\nThe IF only matched mirrored, so the IF pane has been flipped ↔."
+        msg += ("\n\nCheck the nuclei overlay (N) across the tissue. Remove a bad keypoint by selecting it "
+                "in the list and pressing Del; add more with overlay placement (O).")
+        self.statusBar().showMessage(msg.split("\n")[0])
+        QtWidgets.QMessageBox.information(self, "Automatic alignment", msg)
+
     def _orient(self, F):
         self.R.set_orientation(F @ self.R.O)
         self._redraw_keypoints()
