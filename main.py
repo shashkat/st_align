@@ -1019,9 +1019,11 @@ class MainWindow(QtWidgets.QMainWindow):
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
         form.addRow(buttons)
-        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-            return
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            self.run_auto_align(mode.currentData(), n.value(), replace=replace.isChecked())
 
+    def run_auto_align(self, if_mode="gray", n_keypoints=12, replace=True):
+        """Place keypoints automatically (see autoalign.py). Returns the autoalign result, or None."""
         prog = QtWidgets.QProgressDialog("Starting…", None, 0, 100, self)
         prog.setWindowTitle("Automatic alignment")
         prog.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
@@ -1035,7 +1037,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
         try:
-            r = autoalign.auto_keypoints(self.xen, self.ifim, self.R.O, mode.currentData(), n.value(), progress)
+            r = autoalign.auto_keypoints(self.xen, self.ifim, self.R.O, if_mode, n_keypoints, progress)
         except autoalign.AutoAlignError as e:
             r, err = None, str(e)
         finally:
@@ -1043,11 +1045,11 @@ class MainWindow(QtWidgets.QMainWindow):
             prog.close()
         if r is None:
             QtWidgets.QMessageBox.warning(self, "Automatic alignment failed", err)
-            return
+            return None
 
         if r["mirrored"]:
             self._orient(FLIP_H)                    # show the IF the way round it actually matched
-        if self.pairs and replace.isChecked():
+        if replace:
             self.pairs = []
         self.pairs += r["pairs"]
         self.pending, self.sel = {"L": None, "R": None}, None
@@ -1060,6 +1062,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "in the list and pressing Del; add more with overlay placement (O).")
         self.statusBar().showMessage(msg.split("\n")[0])
         QtWidgets.QMessageBox.information(self, "Automatic alignment", msg)
+        return r
 
     def _orient(self, F):
         self.R.set_orientation(F @ self.R.O)
@@ -1218,6 +1221,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 # ----------------------------------------------------------------------------- start window
+def app_settings():
+    """Persistent settings (last-used files). Tests replace this to keep the real settings untouched."""
+    return QtCore.QSettings("st_align", "st_align")
+
+
 class StartDialog(QtWidgets.QDialog):
     """Pick the input files, then "Start Aligner". Last-used paths are remembered."""
 
@@ -1238,7 +1246,7 @@ class StartDialog(QtWidgets.QDialog):
     def __init__(self, initial=None):
         super().__init__()
         self.setWindowTitle("st_align — choose files")
-        self.settings = QtCore.QSettings("st_align", "st_align")
+        self.settings = app_settings()
         self.edits = {}
         grid = QtWidgets.QGridLayout()
         grid.setColumnStretch(1, 1)

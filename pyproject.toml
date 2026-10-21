@@ -2,6 +2,7 @@
 name = "st-align"
 version = "0.1.0"
 description = "Align spatial transcriptomics (Xenium) data with a post-Xenium IF or H&E image of the same section"
+readme = "README.md"
 authors = [
     { name = "Shashank Katiyar", email = "shashanksk31@gmail.com" }
 ]
@@ -22,5 +23,17 @@ dependencies = [
     "opencv-python-headless>=5.0.0.93",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-qt>=4",
+]
+
 [tool.uv]
 package = false   # a script (python main.py), not an installable package
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+qt_api = "pyqt6"
+markers = ["gui: needs a Qt application (runs headless via QT_QPA_PLATFORM=offscreen)"]
