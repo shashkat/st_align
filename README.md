@@ -259,3 +259,7 @@ uv run main.py --xenium /tmp/st_align_dummy/morphology_focus/ch0000_dapi.ome.tif
   temporary file, and records message boxes in the `messages` fixture instead of showing them.
 - Coordinates are level-0 **Xenium px** and **raw IF px**. Display orientation (`Pane.O`) is display
   only. 3×3 matrices act on column vectors `[x, y, 1]`.
+
+## License
+
+[MIT](LICENSE)

@@ -3,6 +3,8 @@ name = "st-align"
 version = "0.1.0"
 description = "Align spatial transcriptomics (Xenium) data with a post-Xenium IF or H&E image of the same section"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Shashank Katiyar", email = "shashanksk31@gmail.com" }
 ]
