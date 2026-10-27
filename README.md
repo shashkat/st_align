@@ -31,7 +31,7 @@ Requires Python ≥ 3.12.
 With [uv](https://docs.astral.sh/uv/) (recommended):
 
 ```bash
-git clone https://github.com/<your-username>/st_align.git
+git clone https://github.com/shashkat/st_align.git
 cd st_align
 uv sync
 ```
